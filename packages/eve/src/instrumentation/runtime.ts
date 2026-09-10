@@ -42,7 +42,7 @@ import {
   type PrepareTurnTraceContextInput,
 } from "#instrumentation/prepare-trace-context.js";
 import type { RuntimeTraceContext } from "#protocol/message.js";
-import type { AgentSpanIdGenerator } from "#tracing/agent-span-id-generator.js";
+import { AgentSpanIdGenerator } from "#tracing/agent-span-id-generator.js";
 import type { OtelHarnessSettings, RuntimeContextResolver } from "#tracing/otel-declaration.js";
 import type { SessionTraceSeed } from "#context/keys.js";
 import { contextStorage, type ContextContainer } from "#context/container.js";
@@ -52,10 +52,13 @@ import {
   OtelTraceEnabledKey,
   ParentSessionKey,
   ParentTraceContextKey,
+  SessionCallbackKey,
   SessionTraceSeedKey,
 } from "#context/keys.js";
 import { ChannelKey } from "#runtime/sessions/runtime-context-keys.js";
 import { normalizeChannelAudience } from "#shared/channel-audience.js";
+import { withErrorContent } from "#tracing/error-content-context.js";
+import type { AgentSamplingOperation } from "#tracing/agent-span-contract.js";
 import {
   isSampledTrace,
   resolveTracePolicy,
@@ -144,6 +147,8 @@ export interface BoundInstrumentationSession {
 
 /** Process-wide runtime consumed by every harness execution surface. */
 export interface InstrumentationRuntime {
+  /** Materializes settled invocation spans without draining the exporter pipeline. */
+  readonly flushSettledInvocations?: () => Promise<void>;
   readonly forceFlush: () => Promise<void>;
   readonly hooks: InstrumentationHooks;
   readonly idGenerator?: AgentSpanIdGenerator;
@@ -159,7 +164,7 @@ export interface InstrumentationRuntime {
   readonly runtimeContextResolvers?: readonly RuntimeContextResolver[];
   readonly runInContext: InstrumentationContextRunner;
   /** Whether the installed OTel sampler would record a trace with this id. */
-  readonly samplesTrace?: (traceId: string) => boolean;
+  readonly samplesTrace?: (traceId: string, operation?: AgentSamplingOperation) => boolean;
   readonly shutdown: () => Promise<void>;
   stepStartedRuntimeContextResolver?: InstrumentationEvents["step.started"];
 }
@@ -197,13 +202,13 @@ export function bindInstrumentationRuntime(
   ctx: ContextContainer,
   boundSession: BoundInstrumentationSession,
 ): ExecutionInstrumentation | undefined {
-  if (runtime === undefined) return undefined;
   if (readConversationId(ctx.get(ConversationIdKey)) === undefined) {
     ctx.set(
       ConversationIdKey,
       ctx.get(ParentSessionKey)?.rootSessionId ?? boundSession.rootSessionId,
     );
   }
+  if (runtime === undefined) return undefined;
   const baseHooks = runtime.hooks;
   const readSessionContext = () => {
     const context = contextStorage.getStore() ?? ctx;
@@ -214,12 +219,15 @@ export function bindInstrumentationRuntime(
         ? undefined
         : { ...storedTraceSeed, ...resolvedTraceState };
     const parentTraceContext = context.get(ParentTraceContextKey);
+    const parent = context.get(ParentSessionKey),
+      channel = context.get(ChannelKey);
     return {
-      channel: context.get(ChannelKey),
+      channel,
       context,
       instrumentation: context.get(ChannelInstrumentationKey),
       forwardedTracePolicy: readForwardedTraceAssertion(traceSeed?.forwardedTracePolicy),
-      parent: context.get(ParentSessionKey),
+      parent,
+      parentLineage: resolveParentLineage(parent, channel, context.get(SessionCallbackKey)),
       parentTraceContext,
       traceSeed,
     };
@@ -259,7 +267,7 @@ export function bindInstrumentationRuntime(
         agentName: boundSession.agentName,
         channelAudience: audience,
         channelType: channel?.channelType,
-        parentLineage: resolveParentLineage(sessionContext.parent, sessionContext.channel),
+        parentLineage: sessionContext.parentLineage,
         parentTraceContext: sessionContext.parentTraceContext,
         rootSessionId: sessionContext.parent?.rootSessionId ?? boundSession.rootSessionId,
         sessionId: boundSession.sessionId,
@@ -402,7 +410,7 @@ export function bindInstrumentationRuntime(
                 channelAudience: audience,
                 channelKind: channel?.kind,
                 hooks,
-                parentLineage: resolveParentLineage(sessionContext.parent, sessionContext.channel),
+                parentLineage: sessionContext.parentLineage,
                 parentTraceContext: sessionContext.parentTraceContext,
                 rootSessionId: sessionContext.parent?.rootSessionId,
                 sessionId: boundSession.sessionId,
@@ -473,9 +481,10 @@ export function bindInstrumentationRuntime(
                   },
           });
         try {
-          return parentContext === undefined
-            ? await run()
-            : await otelContext.with(parentContext, run);
+          return await otelContext.with(
+            withErrorContent(parentContext ?? otelContext.active(), content.recordOutputs),
+            run,
+          );
         } finally {
           turnSpan?.end();
           turnSpan = undefined;
@@ -553,7 +562,11 @@ export function initializeSessionInstrumentation(input: {
       });
     }
     if (forwardedTracePolicy !== undefined && parentTraceContext !== undefined) {
-      const resolvedParent = { ...parentTraceContext, ...traceSeed };
+      const resolvedParent = {
+        ...parentTraceContext,
+        decision: traceSeed.decision,
+        traceFlags: traceSeed.traceFlags,
+      };
       delete resolvedParent.forwardedTracePolicy;
       input.ctx.set(ParentTraceContextKey, resolvedParent);
     }
@@ -580,31 +593,33 @@ function allocateSessionTraceSeed(input: {
       ? traceContentCeilingToDecision(input.forwardedTracePolicy.ceiling)
       : undefined;
     const inheritedDecision = readInstrumentationDecision(input.parentTraceContext.decision);
-    const parentDecision = forwardedCeiling
-      ? inheritedDecision === undefined
-        ? forwardedCeiling
-        : intersectInstrumentationDecisions(forwardedCeiling, inheritedDecision)
-      : (inheritedDecision ??
-        resolveTracePolicyDecision(isSampledTrace(input.parentTraceContext), input.audience));
+    const parentDecision = !isSampledTrace(input.parentTraceContext)
+      ? { action: "drop" as const }
+      : forwardedCeiling
+        ? inheritedDecision === undefined
+          ? forwardedCeiling
+          : intersectInstrumentationDecisions(forwardedCeiling, inheritedDecision)
+        : (inheritedDecision ??
+          resolveTracePolicyDecision(isSampledTrace(input.parentTraceContext), input.audience));
     const decision = input.forwardedTracePolicy
       ? intersectInstrumentationDecisions(parentDecision, localDecision())
       : parentDecision;
+    const idGenerator = input.runtime?.idGenerator ?? new AgentSpanIdGenerator();
     return {
       decision,
-      forwardedTracePolicy: input.forwardedTracePolicy,
-      spanId: input.parentTraceContext.spanId,
-      traceFlags:
-        input.forwardedTracePolicy !== undefined && decision.action === "drop"
-          ? input.parentTraceContext.traceFlags & ~1
-          : input.parentTraceContext.traceFlags,
-      traceId: input.parentTraceContext.traceId,
+      ...(input.forwardedTracePolicy === undefined
+        ? undefined
+        : { forwardedTracePolicy: input.forwardedTracePolicy }),
+      spanId: idGenerator.allocateSpanId(),
+      traceFlags: decision.action === "drop" ? 0 : input.parentTraceContext.traceFlags,
+      traceId: idGenerator.generateTraceId(),
     };
   }
   if (input.runtime?.prepareSessionTrace === undefined || input.runtime.idGenerator === undefined)
     return undefined;
   const decision = localDecision();
   const traceId = input.runtime.idGenerator.generateTraceId();
-  const sampled = decision.action === "record" && (input.runtime.samplesTrace?.(traceId) ?? true);
+  const sampled = decision.action === "record";
   return {
     decision,
     spanId: input.runtime.idGenerator.allocateSpanId(),
@@ -666,7 +681,6 @@ export function registerInstrumentationRuntime(
   return runtime;
 }
 
-/** Returns the process instrumentation runtime, when one was installed. */
 export function getInstrumentationRuntime(): InstrumentationRuntime | undefined {
   return globalRuntime[INSTRUMENTATION_RUNTIME_KEY];
 }

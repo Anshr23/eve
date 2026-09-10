@@ -124,6 +124,12 @@ describe("initializeSessionInstrumentation", () => {
       traceFlags: 1,
     });
     expect(ctx.get(ParentTraceContextKey)).toMatchObject({ traceFlags: 1 });
+    expect(ctx.get(ParentTraceContextKey)).toMatchObject({
+      spanId: "c".repeat(16),
+      traceId: "d".repeat(32),
+    });
+    expect(ctx.get(SessionTraceSeedKey)?.spanId).not.toBe("c".repeat(16));
+    expect(ctx.get(SessionTraceSeedKey)?.traceId).not.toBe("d".repeat(32));
     expect(ctx.get(ParentTraceContextKey)).not.toHaveProperty("forwardedTracePolicy");
     expect(ctx.get(SessionTraceSeedKey)?.forwardedTracePolicy).toEqual({
       ceiling: { recordInputs: true, recordOutputs: true },
@@ -302,7 +308,7 @@ describe("initializeSessionInstrumentation", () => {
     expect(ceiling).toEqual({ recordInputs: false, recordOutputs: false });
   });
 
-  it("preserves sampled flags for a non-forwarded parent decision", () => {
+  it("drops the independent trace when a local parent decision drops", () => {
     const ctx = createContext("public");
     ctx.set(ParentTraceContextKey, {
       decision: { action: "drop" },
@@ -322,20 +328,36 @@ describe("initializeSessionInstrumentation", () => {
 
     expect(ctx.get(SessionTraceSeedKey)).toMatchObject({
       decision: { action: "drop" },
-      traceFlags: 1,
+      traceFlags: 0,
     });
     expect(ctx.get(ParentTraceContextKey)).toMatchObject({ traceFlags: 1 });
+  });
+
+  it("does not widen an unsampled parent with a record decision", () => {
+    const ctx = createContext("public");
+    ctx.set(ParentTraceContextKey, {
+      decision: { action: "record", recordInputs: true, recordOutputs: true },
+      spanId: "c".repeat(16),
+      traceFlags: 0,
+      traceId: "d".repeat(32),
+    });
+    initializeSessionInstrumentation({ agentName: "local-subagent", ctx });
+    expect(ctx.get(SessionTraceSeedKey)).toMatchObject({
+      decision: { action: "drop" },
+      traceFlags: 0,
+    });
+    expect(ctx.get(SessionTraceSeedKey)?.traceId).not.toBe("d".repeat(32));
   });
 });
 
 describe("bindInstrumentationRuntime", () => {
-  it("returns no worker controls when no runtime is loaded", () => {
+  it("initializes conversation identity without worker controls when no runtime is loaded", () => {
     const ctx = new ContextContainer();
     expect(bindInstrumentationRuntime(undefined, ctx, boundSession)).toBeUndefined();
-    expect(ctx.get(ConversationIdKey)).toBeUndefined();
+    expect(ctx.get(ConversationIdKey)).toBe(boundSession.rootSessionId);
   });
 
-  it("uses the effective parent root to initialize correlation without replacing it", () => {
+  it.each([true, false])("preserves effective correlation (runtime installed: %s)", (installed) => {
     const ctx = createContext();
     ctx.set(ParentSessionKey, {
       callId: "call",
@@ -343,7 +365,9 @@ describe("bindInstrumentationRuntime", () => {
       rootSessionId: "effective-root",
       turn: { id: "turn", sequence: 0 },
     });
-    const runtime = createRuntime({ capturesContent: true, publish: vi.fn() });
+    const runtime = installed
+      ? createRuntime({ capturesContent: true, publish: vi.fn() })
+      : undefined;
     bindInstrumentationRuntime(runtime, ctx, boundSession);
     expect(ctx.get(ConversationIdKey)).toBe("effective-root");
     ctx.set(ConversationIdKey, "original-conversation");
@@ -741,7 +765,7 @@ describe("initializeSessionInstrumentation", () => {
     });
   }
 
-  it("marks the seed unsampled when the installed sampler drops the trace", () => {
+  it("defers sampler admission until activation metadata is available", () => {
     const samplesTrace = vi.fn(() => false);
     registerSeedRuntime({ samplesTrace });
     const ctx = createContext();
@@ -749,9 +773,9 @@ describe("initializeSessionInstrumentation", () => {
     initializeSessionInstrumentation({ agentName: "test-agent", ctx });
 
     const seed = ctx.get(SessionTraceSeedKey);
-    expect(seed?.traceFlags).toBe(0);
+    expect(seed?.traceFlags).toBe(1);
     expect(seed?.decision).toMatchObject({ action: "record" });
-    expect(samplesTrace).toHaveBeenCalledExactlyOnceWith(seed?.traceId);
+    expect(samplesTrace).not.toHaveBeenCalled();
   });
 
   it("keeps the seed sampled when the sampler admits the trace", () => {

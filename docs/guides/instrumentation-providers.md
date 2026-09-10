@@ -235,6 +235,9 @@ An ordinary tool emits both `action.*` and `tool.call.*` events. Use `action.*` 
 
 Handlers for different providers run concurrently and are failure-isolated. Do not depend on provider execution order. Use `flush` to drain buffered records and `shutdown` to release resources.
 
+The [agent trace contract](./instrumentation#agent-trace-contract) defines span
+names, identities, and usage counters shared by the exporters and local viewers.
+
 ## What to read next
 
 - [Observability](./instrumentation): the default `instrumentation.ts` API and trace hierarchy

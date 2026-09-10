@@ -56,6 +56,8 @@ Three more fields control what the AI SDK records inside those spans (see the AI
 
 eve records metadata without model or tool inputs and outputs by default. Enable either content category only after reviewing the exporter and its data-retention path.
 
+In the provider layout, eve stamps each span with `gen_ai.conversation.id`, which stays fixed across local and remote activations, including independent remote root workflows. Query this attribute to find the conversation's exported, retained traces; it does not grant access or control trace parenting. On Vercel, `vercel.session_id` additionally identifies the current Workflow run.
+
 You are responsible for ensuring any observability or eval provider is approved for the data exported to it.
 
 The third configurable surface, [runtime context events](#runtime-context), attaches per-model-call values to these spans.
@@ -79,11 +81,9 @@ and outcome fields. Content providers additionally receive only eve's known
 message, context, input-response, and output-schema fields; adapter-specific
 payload fields are never projected.
 
-The built-in OpenTelemetry provider maps each pair to an
-`agent.channel.delivery` consumer span under the durable session window. When
-`traceChannelRequests: true` creates an inbound HTTP server span, the delivery
-span links to it with `eve.link.type=channel.request` rather than using the
-short-lived request span as its parent.
+For a single delivery that starts a turn, the built-in OpenTelemetry provider records the channel kind, channel name, delivery ID, optional request ID, and captured input on that turn's `invoke_agent` activation. The activation remains a root in its own trace and links to the active upstream request or function span with `eve.link.type=channel.request`. Set `traceChannelRequests: true` to create an eve-owned HTTP server span as that link target; when the option is false, an already-active upstream span remains the target.
+
+Deliveries that do not map one-to-one to an activation still produce instrumentation lifecycle events, but the built-in OpenTelemetry provider does not emit a separate delivery span.
 
 ## Callback delivery errors
 
@@ -103,12 +103,12 @@ not mark the active span as failed.
 The built-in OpenTelemetry provider preserves each span's OTel name and adds
 `operation.name` and `resource.name` for Datadog's operation/resource mapping:
 
-| OTel span name                                                                                                     | `operation.name`  | `resource.name`        |
-| ------------------------------------------------------------------------------------------------------------------ | ----------------- | ---------------------- |
-| `invoke_agent weather`                                                                                             | `invoke_agent`    | `invoke_agent weather` |
-| `execute_tool search`                                                                                              | `execute_tool`    | `execute_tool search`  |
-| `chat <model>`                                                                                                     | `chat`            | `chat <model>`         |
-| `agent.session`, `agent.step`, `agent.action`, `agent.approval`, `agent.channel.delivery`, `agent.channel.request` | Same as span name | Same as span name      |
+| OTel span name                                                          | `operation.name`  | `resource.name`        |
+| ----------------------------------------------------------------------- | ----------------- | ---------------------- |
+| `invoke_agent weather`                                                  | `invoke_agent`    | `invoke_agent weather` |
+| `execute_tool search`                                                   | `execute_tool`    | `execute_tool search`  |
+| `chat <model>`                                                          | `chat`            | `chat <model>`         |
+| `agent.step`, `agent.action`, `agent.approval`, `agent.channel.request` | Same as span name | Same as span name      |
 
 These attributes apply to eve-owned spans in local tracing and the
 [instrumentation provider layout](./instrumentation-providers). They do not
@@ -136,6 +136,56 @@ status; cancellation is not an error. The scalar outcome survives backends
 that discard span events, including Sentry's [direct OTLP
 intake](https://docs.sentry.io/concepts/otlp/direct/traces/). These attributes
 remain available when model and tool content is redacted.
+
+## Agent trace contract
+
+The provider layout and zero-config local tracing emit the following spans.
+The legacy `instrumentation.ts` layout still uses its authored OTel setup.
+
+| Span                    | Meaning                                                  |
+| ----------------------- | -------------------------------------------------------- |
+| `invoke_agent <agent>`  | One agent activation in its own trace                    |
+| `agent.step`            | One model attempt                                        |
+| `agent.action`          | Durable action lifecycle, including dispatch and waiting |
+| `execute_tool <tool>`   | In-process tool execution beneath its action             |
+| `agent.approval`        | Approval waiting beneath its action                      |
+| `agent.channel.request` | Optional HTTP request span in the provider layout        |
+
+Schema v4 removes the session-long `agent.session` root and duplicate agent session and lineage attributes. Every eve span carries `agent.trace.schema.version=4` and `gen_ai.conversation.id`; Vercel deployments additionally carry `vercel.session_id`.
+Only activations use the `invoke_agent` operation. Dispatch lifecycle spans use
+`agent.action` with `agent.invocation.role=caller`; the built-in `agent` tool
+executes under `execute_tool agent`. Turn IDs such as `turn_0` are local to a session,
+so correlate turns by session ID and turn ID together.
+
+Each activation owns a fresh trace identity, including local and remote
+subagents. The first child activation links to its caller with
+`eve.link.type=agent.dispatch`; incoming `traceparent` provides that link, not
+the child trace ID. Later turns do not reuse the original caller link.
+Conversation baggage is independent of execution lineage and trace-policy
+ceilings, which remain in force across the boundary.
+
+Channel delivery does not allocate or replace the activation, and a later turn
+receives a new trace. Samplers
+see the activation name and attributes after its session coordinates are
+available. Sampling must be deterministic for the same trace and operation
+because durable reconstruction can evaluate it again.
+
+Activation spans retain `gen_ai.usage.input_tokens` and
+`gen_ai.usage.output_tokens` alongside `agent.usage.*` totals for that activation.
+Model spans carry `gen_ai.usage.*`; step and dispatch spans report
+`agent.usage.*`. Do not sum usage across these levels.
+
+Nested dispatch spans are materialized when the child settles and handed to
+span processors; successful materialization removes their completed records
+from durable state. Settlement does not drain exporters or authored providers.
+Materialization failures are logged without failing settlement, and exporter
+draining follows the runtime's normal flush lifecycle.
+
+Cancelled or abandoned dispatches retain
+their outcome without error status. Error messages and stacks on eve spans count as
+output content, including errors reconstructed after a worker replacement.
+Metadata-only capture retains failure status without those details. Error logging
+outside eve's instrumented execution retains its existing exception content.
 
 ## Runtime context
 
@@ -198,7 +248,7 @@ eve creates the `ai.eve.turn` parent span per turn and passes enriched telemetry
 
 This hierarchy applies when eve passes telemetry to the AI SDK. When the `otel()` provider layout is declared and eve owns the agent spans, eve names its invocation span `invoke_agent <agent>` and its model-attempt spans `agent.step`. Session, turn, step, and channel context is injected as the framework half of the runtime context (`eve.version`, `eve.session.id`, `eve.environment`, `eve.turn.id`, `eve.turn.sequence`, `eve.step.index`, `eve.channel.kind`) and rides onto the spans alongside any values your `events["step.started"]` callback returns under `runtimeContext`.
 
-Set `traceChannelRequests: true` on `defineInstrumentation` to also wrap each inbound channel HTTP request in a single OpenTelemetry `SERVER` span named for the registered route, which parents the turn tree above (and any `hook.resume` and outgoing HTTP spans):
+Set `traceChannelRequests: true` on `defineInstrumentation` to also wrap each inbound channel HTTP request in a single OpenTelemetry `SERVER` span named for the registered route. In the authored hierarchy above, this span parents the turn tree and any `hook.resume` or outgoing HTTP spans. In the provider layout, `invoke_agent` remains a separate trace root and links to the request span.
 
 ```text
 POST /eve/v1/session/:sessionId
@@ -238,7 +288,7 @@ These tags power the **Agent Runs** tab in the Vercel dashboard. When you deploy
 
 ## Local traces
 
-Without an `instrumentation.ts`, `eve dev` records spans to disk — one trace per session, with turns, model steps, and tool calls. Read them two ways:
+Without an `instrumentation.ts`, `eve dev` records spans to disk with one bounded trace per turn, including its model steps and tool calls. Read them two ways:
 
 - [`/traces`](dev-tui#logs-and-traces) in the dev TUI: a live trace viewer that replays captured content as a conversation.
 - [`eve traces`](../reference/cli#eve-traces): a span tree in the terminal, `eve traces ls` to list. Works after `eve dev` exits.

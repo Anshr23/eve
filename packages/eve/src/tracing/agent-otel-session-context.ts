@@ -1,4 +1,4 @@
-import type { SpanContext, Tracer } from "#compiled/@opentelemetry/api/index.js";
+import type { SpanContext } from "#compiled/@opentelemetry/api/index.js";
 
 import {
   type InstrumentationSessionStartedEvent,
@@ -17,13 +17,18 @@ import {
 } from "#tracing/sampled-trace.js";
 import type { AgentSessionTraceState, AgentTraceStateStore } from "#tracing/agent-trace-state.js";
 import { readInstrumentationDecision } from "#shared/instrumentation-decision.js";
-import { agentSpanNamingAttributes } from "#tracing/agent-span-naming.js";
+import {
+  agentInvocationSpanName,
+  type AgentSamplingOperation,
+} from "#tracing/agent-span-contract.js";
+import { agentActivationAttributes } from "#tracing/agent-otel-runtime-context.js";
+import type { AgentTurnTraceState } from "#tracing/agent-trace-state.js";
 
 interface AgentOtelSessionContextInput {
   readonly frameworkVersion: string;
   readonly idGenerator: AgentSpanIdGenerator;
+  readonly samplesTrace?: (traceId: string, operation?: AgentSamplingOperation) => boolean;
   readonly stateStore: AgentTraceStateStore;
-  readonly tracer: Tracer;
   readonly tracePolicy?: TraceCapturePolicy;
 }
 
@@ -42,66 +47,6 @@ interface AgentOtelSessionContext {
 export function createAgentOtelSessionContext(
   input: AgentOtelSessionContextInput,
 ): AgentOtelSessionContext {
-  const openSessionTrace = (
-    session: SessionMetadata,
-    channelAudience: ChannelAudience,
-    traceDecision: ReturnType<typeof resolveTracePolicy>,
-  ): SpanContext => {
-    if (session.traceSeed !== undefined) {
-      if (traceDecision.action === "drop" || !isSampledTrace(session.traceSeed)) {
-        return {
-          isRemote: false,
-          spanId: session.traceSeed.spanId,
-          traceFlags: 0,
-          traceId: session.traceSeed.traceId,
-        };
-      }
-      const startSpan = () =>
-        input.tracer.startSpan("agent.session", {
-          attributes: {
-            "agent.framework.name": "eve",
-            "agent.framework.version": input.frameworkVersion,
-            "agent.channel.audience": channelAudience,
-            "agent.name": session.agentName,
-            "agent.session.id": session.sessionId,
-            ...agentSpanNamingAttributes("agent.session"),
-            "agent.trace.schema.version": 3,
-          },
-          root: true,
-        });
-      const span = input.idGenerator.withSpanId(session.traceSeed.spanId, () =>
-        input.idGenerator.withTraceId(session.traceSeed!.traceId, startSpan),
-      );
-      span.addEvent("session.started");
-      span.end();
-      return span.spanContext();
-    }
-    // Fallback for already-running workflows that predate the seed.
-    if (traceDecision.action === "drop") {
-      return {
-        isRemote: false,
-        spanId: input.idGenerator.deriveSpanId(`session:${session.sessionId}`),
-        traceFlags: 0,
-        traceId: input.idGenerator.generateTraceId(),
-      };
-    }
-    const span = input.tracer.startSpan("agent.session", {
-      attributes: {
-        "agent.framework.name": "eve",
-        "agent.framework.version": input.frameworkVersion,
-        "agent.channel.audience": channelAudience,
-        "agent.name": session.agentName,
-        "agent.session.id": session.sessionId,
-        ...agentSpanNamingAttributes("agent.session"),
-        "agent.trace.schema.version": 3,
-      },
-      root: true,
-    });
-    span.addEvent("session.started");
-    span.end();
-    return span.spanContext();
-  };
-
   const ensureSessionContext = async (event: SessionMetadata): Promise<AgentSessionTraceState> => {
     let state = await input.stateStore.getSession(event.sessionId);
     if (state === undefined) {
@@ -112,10 +57,7 @@ export function createAgentOtelSessionContext(
         channelAudience,
         channelKind: event.channelKind,
         decision,
-        context:
-          event.parentTraceContext === undefined
-            ? openSessionTrace(event, channelAudience, decision)
-            : adoptedSpanContext(event.parentTraceContext),
+        context: initialSessionContext(input, event, decision),
         rootSessionId: event.rootSessionId,
         parentLineage: event.parentLineage,
       };
@@ -137,35 +79,44 @@ export function createAgentOtelSessionContext(
     const prepared = await input.stateStore.getTurn(event.sessionId, event.turnId);
     if (prepared !== undefined) {
       const session = await input.stateStore.getSession(event.sessionId);
-      return {
-        decision: session?.decision,
-        spanId: prepared.parentSpanId,
-        traceFlags: prepared.context.traceFlags,
-        traceId: prepared.context.traceId,
-      };
+      return portableSpanContext(prepared.context, session?.decision);
     }
 
     const session = await ensureSessionContext(event);
-    // The turn outlives this worker, so no live span can cover it: the span
-    // id is allocated now for descendants to parent through, and the span
-    // itself is emitted at the turn's session transition.
-    const turnContext: SpanContext = {
-      isRemote: false,
-      spanId: input.idGenerator.deriveSpanId(`turn:${event.idempotencyKey}`),
-      traceFlags: session.context.traceFlags,
-      traceId: session.context.traceId,
-    };
-    await input.stateStore.setTurn(event.sessionId, event.turnId, {
+    const useInitialContext = event.sequence === 0;
+    const caller = useInitialContext ? event.parentTraceContext : undefined;
+    let turnContext = useInitialContext
+      ? { ...session.context, isRemote: false }
+      : freshTurnContext(input, event.idempotencyKey, session.decision);
+    const turn: AgentTurnTraceState = {
+      caller: caller === undefined ? undefined : adoptedSpanContext(caller),
       context: turnContext,
-      parentIsRemote: session.context.isRemote,
       parentLineage: event.parentLineage ?? session.parentLineage,
-      parentSpanId: session.context.spanId,
       rootSessionId: event.rootSessionId,
       sequence: event.sequence,
       startTimeMs: Date.now(),
       subagentName: (event.parentLineage ?? session.parentLineage)?.subagentName,
+    };
+    if (isSampledTrace(turn.context)) {
+      const agentName = session.agentName ?? turn.subagentName;
+      const sampled =
+        input.samplesTrace?.(turn.context.traceId, {
+          name: agentInvocationSpanName(agentName),
+          attributes: agentActivationAttributes({
+            agentName,
+            frameworkVersion: input.frameworkVersion,
+            sessionId: event.sessionId,
+            turnId: event.turnId,
+            turn,
+          }),
+        }) ?? true;
+      turnContext = { ...turnContext, traceFlags: sampled ? 1 : 0 };
+    }
+    await input.stateStore.setTurn(event.sessionId, event.turnId, {
+      ...turn,
+      context: turnContext,
     });
-    return portableSpanContext(session.context, session.decision);
+    return portableSpanContext(turnContext, session.decision);
   };
 
   return { ensureSessionContext, prepareSessionTrace, prepareTurnTrace };
@@ -192,11 +143,51 @@ function adoptedSpanContext(handed: InstrumentationTraceContext): SpanContext {
   };
 }
 
+function initialSessionContext(
+  input: AgentOtelSessionContextInput,
+  event: SessionMetadata,
+  decision: ReturnType<typeof resolveTracePolicy>,
+): SpanContext {
+  const handed = event.traceSeed;
+  if (handed !== undefined) {
+    return {
+      ...adoptedSpanContext(handed),
+      traceFlags: decision.action === "drop" ? 0 : handed.traceFlags,
+    };
+  }
+  const traceId = input.idGenerator.deriveTraceId(`session:${event.sessionId}`);
+  const sampled = decision.action === "record";
+  return {
+    isRemote: false,
+    spanId: input.idGenerator.deriveSpanId(`session:${event.sessionId}`),
+    traceFlags: sampled ? 1 : 0,
+    traceId,
+  };
+}
+
+function freshTurnContext(
+  input: AgentOtelSessionContextInput,
+  idempotencyKey: string,
+  decision: AgentSessionTraceState["decision"],
+): SpanContext {
+  const traceId = input.idGenerator.deriveTraceId(`turn:${idempotencyKey}`);
+  const sampled = decision?.action === "record";
+  return {
+    isRemote: false,
+    spanId: input.idGenerator.deriveSpanId(`turn:${idempotencyKey}`),
+    traceFlags: sampled ? 1 : 0,
+    traceId,
+  };
+}
+
 function resolveSessionTraceDecision(
   event: SessionMetadata,
   audience: ChannelAudience,
   policy: TraceCapturePolicy | undefined,
 ): ReturnType<typeof resolveTracePolicy> {
+  if (event.parentTraceContext !== undefined && !isSampledTrace(event.parentTraceContext)) {
+    return { action: "drop" };
+  }
   if (event.traceSeed?.decision !== undefined) {
     return readInstrumentationDecision(event.traceSeed.decision) ?? { action: "drop" };
   }
