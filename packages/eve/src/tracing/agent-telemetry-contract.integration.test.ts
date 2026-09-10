@@ -2,6 +2,7 @@ import {
   BasicTracerProvider,
   InMemorySpanExporter,
   SimpleSpanProcessor,
+  type ReadableSpan,
 } from "@opentelemetry/sdk-trace-base";
 import { describe, expect, it, vi } from "vitest";
 import { SpanStatusCode } from "#compiled/@opentelemetry/api/index.js";
@@ -44,6 +45,7 @@ import {
   assembleLocalTrace,
   isAgentTurnSpan,
   parseLocalTraceSegment,
+  type LocalTraceSpan,
 } from "#tracing/local-trace-reader.js";
 import { summarizeLocalTrace } from "#cli/commands/trace-detail.js";
 import { buildConversationItems } from "#cli/dev/tui/traces/trace-conversation.js";
@@ -256,7 +258,7 @@ describe("exported agent telemetry contract", () => {
   );
 
   it.each(["public", "private"] as const)(
-    "round-trips %s channel, approval, delegated error and usage spans through the readers",
+    "round-trips the normalized %s v4 trace forest through OTLP",
     async (audience) => {
       const runtime = createRuntime();
       let parent = contextFor(audience);
@@ -283,7 +285,17 @@ describe("exported agent telemetry contract", () => {
             kind: "deliver",
             payloads: [{ message: "private input" }],
             deliveryMetadata: [
-              { channelKind: "http", channelName: "web", deliveryId: "delivery", payloadIndex: 0 },
+              {
+                channelKind: "http",
+                channelName: "web",
+                deliveryId: "delivery",
+                payloadIndex: 0,
+                requestTraceContext: {
+                  spanId: "e".repeat(16),
+                  traceFlags: 1,
+                  traceId: "f".repeat(32),
+                },
+              },
             ],
           },
         });
@@ -433,10 +445,10 @@ describe("exported agent telemetry contract", () => {
           kind: "subagent-result",
           origin: "child",
           subagentName: "child",
-          output: "private failure",
+          output: "private reply",
           outcome: {
             kind: "terminal",
-            result: { kind: "failed", error: { message: "private failure" } },
+            result: { kind: "succeeded", output: "private reply" },
             usageDelta: {
               inputTokens: 10,
               outputTokens: 5,
@@ -446,7 +458,7 @@ describe("exported agent telemetry contract", () => {
           },
         },
       });
-      if (audience === "private") expect(JSON.stringify(settled)).not.toContain("private failure");
+      if (audience === "private") expect(JSON.stringify(settled)).not.toContain("private reply");
       parent = await deserializeContext(settled);
       await contextStorage.run(parent, async () => {
         await runtime.forceFlush();
@@ -492,11 +504,68 @@ describe("exported agent telemetry contract", () => {
           type: "session.waiting",
         });
       });
+      for (const [sequence, outcome] of [
+        [1, "failed"],
+        [2, "cancelled"],
+      ] as const) {
+        const turnId = `turn_${String(sequence)}`;
+        await contextStorage.run(parent, async () => {
+          await binding.instrumentChannelDelivery({
+            ctx: parent,
+            agentName: "parent",
+            rootSessionId: "parent",
+            sequence,
+            sessionId: "parent",
+            turnId,
+            delivery: {
+              kind: "deliver",
+              payloads: [{ message: outcome }],
+              deliveryMetadata: [
+                {
+                  channelKind: "http",
+                  channelName: "web",
+                  deliveryId: `delivery-${outcome}`,
+                  payloadIndex: 0,
+                },
+              ],
+            },
+          });
+          await binding.preparePreamble({ sequence, sessionStarted: true, turnId });
+          await binding.instrumentChannelDelivery({
+            ctx: parent,
+            error: outcome === "failed" ? new Error("expected failure") : undefined,
+            includeTurn: true,
+            outcome,
+          });
+          await hooks.publish(
+            outcome === "failed"
+              ? {
+                  error: new Error("expected failure"),
+                  idempotencyKey: turnIdempotencyKey("parent", turnId),
+                  sessionId: "parent",
+                  turnId,
+                  type: "turn.failed",
+                }
+              : {
+                  idempotencyKey: turnIdempotencyKey("parent", turnId),
+                  sessionId: "parent",
+                  turnId,
+                  type: "turn.cancelled",
+                },
+          );
+          await hooks.publish({
+            idempotencyKey: sessionIdempotencyKey("parent"),
+            sessionId: "parent",
+            turnId,
+            type: "session.waiting",
+          });
+        });
+      }
       await runtime.forceFlush();
       const exported = runtime.exporter.getFinishedSpans();
       const bytes = JsonTraceSerializer.serializeRequest(exported)!;
       const traceIds = [...new Set(exported.map((span) => span.spanContext().traceId))];
-      expect(traceIds).toHaveLength(2);
+      expect(traceIds).toHaveLength(4);
       const traces = traceIds.map((traceId) =>
         assembleLocalTrace(
           traceId,
@@ -516,16 +585,21 @@ describe("exported agent telemetry contract", () => {
         parsed.every((span) => Number(span.attributes["agent.trace.schema.version"]) === 4),
       ).toBe(true);
       for (const span of parsed) {
-        expect(span.attributes).not.toHaveProperty("agent.session.id");
+        expect(span.attributes["resource.name"]).toBe(span.name);
+        expect(span.attributes["operation.name"]).toBe(
+          span.attributes["gen_ai.operation.name"] ?? span.name,
+        );
+        for (const legacy of [
+          "agent.parent_call.id",
+          "agent.parent_run.id",
+          "agent.root_run.id",
+          "agent.session.id",
+        ]) {
+          expect(span.attributes).not.toHaveProperty(legacy);
+        }
         expect(span.attributes).not.toHaveProperty("vercel.session_id");
       }
-      expect(
-        parsed
-          .filter((span) => span.parentSpanId === undefined)
-          .map((span) => span.name)
-          .sort(),
-      ).toEqual(["invoke_agent child", "invoke_agent parent"]);
-      expect(parsed.filter(isAgentTurnSpan)).toHaveLength(2);
+      expect(parsed.filter(isAgentTurnSpan)).toHaveLength(4);
       for (const activation of parsed.filter(isAgentTurnSpan)) {
         expect(activation.attributes["agent.principal.current.type"]).toBe("service");
         expect(activation.attributes["agent.principal.initiator.type"]).toBe("user");
@@ -551,7 +625,6 @@ describe("exported agent telemetry contract", () => {
         "agent.channel.kind": "http",
         "agent.channel.name": "web",
       });
-      const childSpan = exported.find((span) => span.spanContext().spanId === activation.spanId)!;
       expect(activation.attributes).toMatchObject({
         "gen_ai.usage.input_tokens": 10,
         "gen_ai.usage.output_tokens": 5,
@@ -560,25 +633,26 @@ describe("exported agent telemetry contract", () => {
       });
       expect(caller.attributes["gen_ai.usage.input_tokens"]).toBeUndefined();
       expect(caller.attributes["gen_ai.usage.output_tokens"]).toBeUndefined();
-      expect(childSpan.links).toEqual([
-        {
-          context: expect.objectContaining({ spanId: caller.spanId, traceId: caller.traceId }),
-          attributes: { "eve.link.type": "agent.dispatch" },
-        },
+      expect(normalizeTraceForest(parsed, exported)).toEqual([
+        "conversation original-conversation",
+        "trace parent:turn_0 outcome=completed channel=http:web delivery=delivery",
+        "  invoked from external via channel.request",
+        "  invoke_agent parent",
+        "    agent.step",
+        "      agent.action coordinate",
+        "        agent.action child role=caller",
+        "        agent.approval approved",
+        "        execute_tool coordinate",
+        "trace child:turn_0 outcome=completed",
+        "  invoked from parent:turn_0/agent.action child role=caller via agent.dispatch",
+        "  invoke_agent child",
+        "    agent.step",
+        "      chat test",
+        "trace parent:turn_1 outcome=failed channel=http:web delivery=delivery-failed",
+        "  invoke_agent parent",
+        "trace parent:turn_2 outcome=cancelled channel=http:web delivery=delivery-cancelled",
+        "  invoke_agent parent",
       ]);
-      expect(parsed.map((span) => span.name).sort()).toEqual(
-        [
-          "agent.action",
-          "agent.action",
-          "agent.approval",
-          "agent.step",
-          "agent.step",
-          "chat test",
-          "execute_tool coordinate",
-          "invoke_agent child",
-          "invoke_agent parent",
-        ].sort(),
-      );
       expect(summarizeLocalTrace(parsed)).toMatchObject({
         inputTokens: 10,
         outputTokens: 5,
@@ -590,9 +664,15 @@ describe("exported agent telemetry contract", () => {
       const metadata = new TextDecoder().decode(
         JsonTraceSerializer.serializeRequest(runtime.metadata.getFinishedSpans())!,
       );
+      const metadataSpans = traceIds.flatMap((traceId) =>
+        parseLocalTraceSegment(metadata, traceId),
+      );
+      expect(metadataSpans.map((span) => [span.name, span.attributes["resource.name"]])).toEqual(
+        parsed.map((span) => [span.name, span.name]),
+      );
       expect(metadata).not.toContain("private ");
       if (audience === "private") expect(new TextDecoder().decode(bytes)).not.toContain("private ");
-      else expect(new TextDecoder().decode(bytes)).toContain("private failure");
+      else expect(new TextDecoder().decode(bytes)).toContain("private reply");
       await runtime.shutdown();
     },
   );
@@ -641,6 +721,15 @@ describe("exported agent telemetry contract", () => {
       "initiator-user",
     ]);
     expect(new Set(spans.map((span) => span.spanContext().traceId)).size).toBe(2);
+    for (const span of spans) {
+      expect(span.parentSpanContext).toBeUndefined();
+      expect(span.attributes).toMatchObject({
+        "agent.trace.schema.version": 4,
+        "gen_ai.conversation.id": "parent",
+        "operation.name": "invoke_agent",
+        "resource.name": "invoke_agent parent",
+      });
+    }
     await runtime.shutdown();
   });
 
@@ -733,4 +822,147 @@ describe("exported agent telemetry contract", () => {
       }
     },
   );
+
+  it.each(["completed", "failed", "cancelled"] as const)(
+    "exports a queryable %s activation outcome without relying on span events",
+    async (outcome) => {
+      const runtime = createRuntime();
+      const ctx = contextFor("private");
+      const hooks = runtime.hooks.forTrace!({ agentName: "parent", audience: "private" });
+      const binding = bindInstrumentationRuntime(runtime, ctx, {
+        agentName: "parent",
+        rootSessionId: "parent",
+        sessionId: "parent",
+      })!;
+      await contextStorage.run(ctx, async () => {
+        await binding.preparePreamble({ sequence: 0, sessionStarted: false, turnId: "turn_0" });
+        const identity = {
+          idempotencyKey: turnIdempotencyKey("parent", "turn_0"),
+          sessionId: "parent",
+          turnId: "turn_0",
+        };
+        await hooks.publish(
+          outcome === "failed"
+            ? { ...identity, type: "turn.failed", error: new Error("private failure") }
+            : { ...identity, type: outcome === "completed" ? "turn.completed" : "turn.cancelled" },
+        );
+        await hooks.publish({
+          idempotencyKey: sessionIdempotencyKey("parent"),
+          sessionId: "parent",
+          turnId: "turn_0",
+          type: "session.waiting",
+        });
+      });
+      await runtime.forceFlush();
+      const spans = runtime.metadata.getFinishedSpans();
+      const bytes = JsonTraceSerializer.serializeRequest(
+        spans.map((span) => ({
+          ...span,
+          events: [],
+          spanContext: () => span.spanContext(),
+        })),
+      )!;
+      const serialized = new TextDecoder().decode(bytes);
+      const [activation] = parseLocalTraceSegment(serialized, spans[0]!.spanContext().traceId);
+      expect(activation?.attributes["agent.turn.outcome"]).toBe(outcome);
+      expect(activation?.statusCode).toBe(outcome === "failed" ? 2 : 0);
+      expect(serialized).not.toContain("private failure");
+      await runtime.shutdown();
+    },
+  );
 });
+
+function normalizeTraceForest(
+  spans: readonly LocalTraceSpan[],
+  exported: readonly ReadableSpan[],
+): string[] {
+  const roots = spans.filter(
+    (span) => span.parentSpanId === undefined && span.name.startsWith("invoke_agent "),
+  );
+  const aliases = new Map(
+    roots.map((root) => [
+      root.traceId,
+      `${String(root.attributes["agent.name"] ?? root.name.slice("invoke_agent ".length))}:${String(
+        root.attributes["agent.turn.id"] ?? "unknown",
+      )}`,
+    ]),
+  );
+  const causalParents = new Map(
+    exported.flatMap((span) =>
+      span.links
+        .filter(
+          (link) =>
+            link.attributes?.["eve.link.type"] === "agent.dispatch" &&
+            aliases.has(link.context.traceId),
+        )
+        .map((link) => [span.spanContext().traceId, link.context.traceId] as const),
+    ),
+  );
+  const byIdentity = new Map(spans.map((span) => [`${span.traceId}:${span.spanId}`, span]));
+  const children = Map.groupBy(
+    spans.filter((span) => span.parentSpanId !== undefined),
+    (span) => `${span.traceId}:${span.parentSpanId!}`,
+  );
+  const conversationIds = [
+    ...new Set(roots.map((root) => String(root.attributes["gen_ai.conversation.id"]))),
+  ];
+  const lines =
+    conversationIds.length === 1 ? [`conversation ${conversationIds[0]}`] : ["conversation mixed"];
+  for (const root of roots.toSorted((left, right) => {
+    if (causalParents.get(left.traceId) === right.traceId) return 1;
+    if (causalParents.get(right.traceId) === left.traceId) return -1;
+    const sequence =
+      Number(left.attributes["agent.turn.sequence"]) -
+      Number(right.attributes["agent.turn.sequence"]);
+    return sequence || aliases.get(left.traceId)!.localeCompare(aliases.get(right.traceId)!);
+  })) {
+    const alias = aliases.get(root.traceId)!;
+    const channelKind = root.attributes["agent.channel.kind"];
+    const channelName = root.attributes["agent.channel.name"];
+    const deliveryId = root.attributes["agent.channel.delivery.id"];
+    lines.push(
+      `trace ${alias} outcome=${String(root.attributes["agent.turn.outcome"] ?? "unknown")}${
+        channelKind === undefined
+          ? ""
+          : ` channel=${String(channelKind)}:${String(channelName)} delivery=${String(deliveryId)}`
+      }`,
+    );
+    const links = exported
+      .filter((span) => span.spanContext().traceId === root.traceId)
+      .flatMap((span) =>
+        span.links.map((link) => {
+          const target = byIdentity.get(`${link.context.traceId}:${link.context.spanId}`);
+          const type = String(link.attributes?.["eve.link.type"] ?? "unknown");
+          return `  invoked from ${
+            target === undefined
+              ? "external"
+              : `${aliases.get(target.traceId)}/${spanLabel(target)}`
+          } via ${type}`;
+        }),
+      )
+      .sort();
+    lines.push(...links);
+    appendTree(root, 1);
+  }
+  return lines;
+
+  function appendTree(span: LocalTraceSpan, depth: number): void {
+    lines.push(`${"  ".repeat(depth)}${spanLabel(span)}`);
+    for (const child of (children.get(`${span.traceId}:${span.spanId}`) ?? []).toSorted(
+      (left, right) => spanLabel(left).localeCompare(spanLabel(right)),
+    )) {
+      appendTree(child, depth + 1);
+    }
+  }
+}
+
+function spanLabel(span: LocalTraceSpan): string {
+  if (span.name === "agent.action") {
+    const role = span.attributes["agent.invocation.role"] === "caller" ? " role=caller" : "";
+    return `agent.action ${String(span.attributes["agent.action.name"])}${role}`;
+  }
+  if (span.name === "agent.approval") {
+    return `agent.approval ${String(span.attributes["agent.approval.outcome"])}`;
+  }
+  return span.name;
+}
