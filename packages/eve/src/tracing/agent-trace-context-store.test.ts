@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import { ContextContainer, contextStorage } from "#context/container.js";
 import { SessionTraceSeedKey } from "#context/keys.js";
 import { deserializeContext, serializeContext } from "#context/serialize.js";
+import { INSTRUMENTATION_PRINCIPAL_TYPES } from "#instrumentation/lifecycle.js";
+import { deserializeAgentTraceContextState } from "#tracing/agent-trace-context-codec.js";
 import {
   ContextAgentTraceStateStore,
   preserveSerializedAgentTraceState,
@@ -31,6 +33,8 @@ describe("ContextAgentTraceStateStore", () => {
           requestTraceContext: { ...spanContext("5", "6"), isRemote: true },
         },
         context: spanContext("1", "3"),
+        currentPrincipal: { id: "user-123", type: "user" },
+        initiatorPrincipal: { type: "none" },
         modelUsage: { inputTokens: 12, outputTokens: 4 },
         caller: { ...spanContext("4", "2"), isRemote: true },
         rootSessionId: "session-1",
@@ -56,17 +60,50 @@ describe("ContextAgentTraceStateStore", () => {
           requestId: "request-1",
           requestTraceContext: { ...spanContext("5", "6"), isRemote: true },
         },
+        currentPrincipal: { id: "user-123", type: "user" },
+        initiatorPrincipal: { type: "none" },
         modelUsage: { inputTokens: 12, outputTokens: 4 },
         caller: { ...spanContext("4", "2"), isRemote: true },
         startTimeMs: 1_700_000_000_000,
         subagentName: "researcher",
       });
+      expect(store.getTurn("session-1", "turn-1")?.initiatorPrincipal).toStrictEqual({
+        type: "none",
+      });
+      expect(JSON.stringify(store.getTurn("session-1", "turn-1"))).not.toContain("attributes");
       const terminal = store.getTurn("session-1", "turn-1")?.terminal;
       expect(terminal?.type).toBe("turn.failed");
       expect(terminal?.type === "turn.failed" ? terminal.error : undefined).toMatchObject({
         message: "failed",
       });
     });
+  });
+
+  it.each([
+    ...INSTRUMENTATION_PRINCIPAL_TYPES.map((type) => ({
+      input: { type, id: "user-123" },
+      expected: type === "none" ? { type } : { type, id: "user-123" },
+    })),
+    { input: { type: "unrecognized", id: "user-123" }, expected: undefined },
+    ...[undefined, null, 123, "", "x".repeat(1025), String.fromCodePoint(0x1f600).repeat(257)].map(
+      (id) => ({
+        input: { type: "user", id },
+        expected: { type: "user" },
+      }),
+    ),
+  ])("restores bounded principal summaries from $input", ({ input, expected }) => {
+    const state = deserializeAgentTraceContextState({
+      turns: {
+        turn: {
+          context: spanContext("1", "2"),
+          currentPrincipal: input,
+          initiatorPrincipal: input,
+          startTimeMs: 1,
+        },
+      },
+    });
+    expect(state.turns.turn?.currentPrincipal).toStrictEqual(expected);
+    expect(state.turns.turn?.initiatorPrincipal).toStrictEqual(expected);
   });
 
   it("removes terminal state", () => {

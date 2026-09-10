@@ -187,6 +187,15 @@ output content, including errors reconstructed after a worker replacement.
 Metadata-only capture retains failure status without those details. Error logging
 outside eve's instrumented execution retains its existing exception content.
 
+Agent Runs activation metadata includes bounded principal summaries:
+
+- `agent.principal.current.type` and `agent.principal.current.id` describe the current caller.
+- `agent.principal.initiator.type` and `agent.principal.initiator.id` describe the authenticated principal that created the root session. The initiator remains fixed when later turns have a different caller.
+
+Types are limited to `user`, `service`, `runtime`, `app`, `anonymous`, `local-dev`, `unknown`, `none`, and `other`. Types are emitted for every audience when a principal is present. An absent type means no authentication context was set; `none` means an explicitly null principal and has no ID. The auth layer's `unknown` type stays `unknown`; unrecognized authored types become `other`.
+
+Principal IDs require a content-visible audience and a resolved trace decision that allows both `recordInputs` and `recordOutputs`. Public turns and unknown turns under `eve dev` can include IDs; private and hosted-unknown turns omit them. A user-configured trace policy or forwarded content ceiling that denies either direction omits both principal IDs before turn state is stored or sampled. Empty IDs and IDs larger than 1 KiB of UTF-8 data are omitted, not truncated; authentication records are unchanged. eve does not copy other authentication fields, such as claims, email attributes, issuers, or subjects, into these summaries.
+
 ## Runtime context
 
 _Runtime context_ is an [AI SDK concept](https://ai-sdk.dev/docs/reference/ai-sdk-core/stream-text): a user-defined object that flows through a generation lifecycle. eve exposes it through `events["step.started"]`, a callback that runs once eve has assembled the model input for an attempt and returns `{ runtimeContext }`. Because eve registers the AI SDK's OpenTelemetry integration with runtime context enabled, those returned values ride onto the model-call span and its children. The field is named `runtimeContext`, not `metadata`, because AI SDK v7 carries per-call attributes on runtime context rather than a dedicated metadata field.

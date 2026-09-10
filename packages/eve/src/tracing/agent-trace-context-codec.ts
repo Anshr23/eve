@@ -10,6 +10,8 @@ import type {
 import { normalizeChannelAudience } from "#shared/channel-audience.js";
 import { readInstrumentationDecision } from "#shared/instrumentation-decision.js";
 import { boundedTraceError } from "#tracing/bounded-error.js";
+import { boundedPrincipalId } from "#tracing/telemetry-budget.js";
+import { isInstrumentationPrincipalType } from "#instrumentation/lifecycle.js";
 
 export const AGENT_TRACE_CONTEXT_KEY = "eve.harness.agentTrace";
 
@@ -112,6 +114,8 @@ function deserializeTurn(value: unknown): AgentTurnTraceState | undefined {
     caller: isSpanContext(value.caller) ? value.caller : undefined,
     channelDelivery: deserializeTurnChannelDelivery(value.channelDelivery),
     context: value.context,
+    currentPrincipal: deserializePrincipalSummary(value.currentPrincipal),
+    initiatorPrincipal: deserializePrincipalSummary(value.initiatorPrincipal),
     modelUsage: deserializeModelUsage(value.modelUsage),
     parentLineage: deserializeParentLineage(value.parentLineage),
     rootSessionId: typeof value.rootSessionId === "string" ? value.rootSessionId : "",
@@ -141,6 +145,14 @@ function deserializeTurnChannelDelivery(value: unknown): AgentTurnTraceState["ch
       ? value.requestTraceContext
       : undefined,
   };
+}
+
+function deserializePrincipalSummary(
+  value: unknown,
+): AgentTurnTraceState["currentPrincipal"] | undefined {
+  if (!isRecord(value) || !isInstrumentationPrincipalType(value.type)) return undefined;
+  const id = value.type === "none" ? undefined : boundedPrincipalId(value.id);
+  return id === undefined ? { type: value.type } : { id, type: value.type };
 }
 
 function deserializeAction(value: unknown): AgentActionTraceState | undefined {

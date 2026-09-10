@@ -291,6 +291,31 @@ export interface InstrumentationTraceSeed extends InstrumentationTraceContext {
   readonly decision?: InstrumentationDecision;
 }
 
+export const INSTRUMENTATION_PRINCIPAL_TYPES = [
+  "anonymous",
+  "app",
+  "local-dev",
+  "none",
+  "other",
+  "runtime",
+  "service",
+  "unknown",
+  "user",
+] as const;
+
+export type InstrumentationPrincipalType = (typeof INSTRUMENTATION_PRINCIPAL_TYPES)[number];
+
+export function isInstrumentationPrincipalType(
+  value: unknown,
+): value is InstrumentationPrincipalType {
+  return INSTRUMENTATION_PRINCIPAL_TYPES.some((type) => type === value);
+}
+
+export interface InstrumentationPrincipalSummary {
+  readonly id?: string;
+  readonly type: InstrumentationPrincipalType;
+}
+
 /**
  * Which tool call dispatched a subagent child. The trace structure alone
  * cannot say: one turn's children all parent to the same window.
@@ -332,7 +357,9 @@ export type InstrumentationSessionTransitionEvent =
 export interface InstrumentationTurnStartedEvent {
   readonly type: "turn.started";
   readonly agentName?: string;
+  readonly currentPrincipal?: InstrumentationPrincipalSummary;
   readonly idempotencyKey: string;
+  readonly initiatorPrincipal?: InstrumentationPrincipalSummary;
   readonly parentLineage?: InstrumentationParentLineage;
   readonly parentTraceContext?: InstrumentationTraceContext;
   readonly rootSessionId: string;

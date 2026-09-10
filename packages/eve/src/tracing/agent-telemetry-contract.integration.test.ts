@@ -9,8 +9,10 @@ import { SpanStatusCode } from "#compiled/@opentelemetry/api/index.js";
 import { JsonTraceSerializer } from "#compiled/@opentelemetry/otlp-transformer/index.js";
 import { ContextContainer, contextStorage } from "#context/container.js";
 import {
+  AuthKey,
   ChannelInstrumentationKey,
   ConversationIdKey,
+  InitiatorAuthKey,
   ParentSessionKey,
   ParentTraceContextKey,
   SessionTraceSeedKey,
@@ -98,6 +100,18 @@ function createRuntime() {
 function contextFor(audience: "public" | "private") {
   const ctx = new ContextContainer();
   ctx.set(ChannelInstrumentationKey, { kind: "http", metadata: { audience } });
+  ctx.set(AuthKey, {
+    principalId: "current-user",
+    principalType: "service",
+    authenticator: "api-key",
+    attributes: { secret: "auth-only-secret" },
+  });
+  ctx.set(InitiatorAuthKey, {
+    principalId: "initiator-user",
+    principalType: "user",
+    authenticator: "oidc",
+    attributes: { secret: "auth-only-secret" },
+  });
   return ctx;
 }
 
@@ -512,6 +526,17 @@ describe("exported agent telemetry contract", () => {
           .sort(),
       ).toEqual(["invoke_agent child", "invoke_agent parent"]);
       expect(parsed.filter(isAgentTurnSpan)).toHaveLength(2);
+      for (const activation of parsed.filter(isAgentTurnSpan)) {
+        expect(activation.attributes["agent.principal.current.type"]).toBe("service");
+        expect(activation.attributes["agent.principal.initiator.type"]).toBe("user");
+        expect(activation.attributes["agent.principal.current.id"]).toBe(
+          audience === "public" ? "current-user" : undefined,
+        );
+        expect(activation.attributes["agent.principal.initiator.id"]).toBe(
+          audience === "public" ? "initiator-user" : undefined,
+        );
+      }
+      expect(new TextDecoder().decode(bytes)).not.toContain("auth-only-secret");
       const caller = parsed.find((span) => span.attributes["agent.invocation.role"] === "caller")!;
       const activation = parsed.find(
         (span) => span.name === "invoke_agent child" && isAgentTurnSpan(span),
@@ -569,6 +594,143 @@ describe("exported agent telemetry contract", () => {
       if (audience === "private") expect(new TextDecoder().decode(bytes)).not.toContain("private ");
       else expect(new TextDecoder().decode(bytes)).toContain("private failure");
       await runtime.shutdown();
+    },
+  );
+
+  it("exports new current principals but the same initiator on resumed activations", async () => {
+    const runtime = createRuntime();
+    const ctx = contextFor("public");
+    const hooks = runtime.hooks.forTrace!({ agentName: "parent", audience: "public" });
+    const binding = bindInstrumentationRuntime(runtime, ctx, {
+      agentName: "parent",
+      rootSessionId: "parent",
+      sessionId: "parent",
+    })!;
+    await contextStorage.run(ctx, async () => {
+      for (const [sequence, principalId] of ["first", "second"].entries()) {
+        ctx.set(AuthKey, {
+          principalId,
+          principalType: "user",
+          authenticator: "api-key",
+          attributes: {},
+        });
+        const turnId = `turn_${sequence}`;
+        await binding.preparePreamble({ sequence, sessionStarted: sequence > 0, turnId });
+        await hooks.publish({
+          idempotencyKey: turnIdempotencyKey("parent", turnId),
+          sessionId: "parent",
+          turnId,
+          type: "turn.completed",
+        });
+        await hooks.publish({
+          idempotencyKey: sessionIdempotencyKey("parent"),
+          sessionId: "parent",
+          turnId,
+          type: "session.waiting",
+        });
+      }
+    });
+    await runtime.forceFlush();
+    const spans = runtime.exporter.getFinishedSpans();
+    expect(spans.map((span) => span.attributes["agent.principal.current.id"])).toEqual([
+      "first",
+      "second",
+    ]);
+    expect(spans.map((span) => span.attributes["agent.principal.initiator.id"])).toEqual([
+      "initiator-user",
+      "initiator-user",
+    ]);
+    expect(new Set(spans.map((span) => span.spanContext().traceId)).size).toBe(2);
+    await runtime.shutdown();
+  });
+
+  it.each([
+    ["private", false, false],
+    ["private", true, true],
+    ["public", false, true],
+    ["public", true, false],
+    ["public", true, true],
+  ] as const)(
+    "bounds public-channel principal IDs by origin %s and input/output ceiling %s/%s",
+    async (originAudience, recordInputs, recordOutputs) => {
+      const runtime = createRuntime();
+      const hooks = runtime.hooks.forTrace!({ agentName: "child", audience: "public" });
+      const registered = vi
+        .spyOn(instrumentation, "getInstrumentationRuntime")
+        .mockReturnValue(runtime);
+      let ctx = contextFor("public");
+      ctx.set(ParentTraceContextKey, {
+        forwardedTracePolicy: {
+          ceiling: { recordInputs, recordOutputs },
+          originAudience,
+        },
+        spanId: "c".repeat(16),
+        traceFlags: 1,
+        traceId: "d".repeat(32),
+      });
+      const includesIds = originAudience === "public" && recordInputs && recordOutputs;
+      try {
+        instrumentation.initializeSessionInstrumentation({ agentName: "child", ctx });
+        expect(ctx.get(SessionTraceSeedKey)?.decision).toEqual({
+          action: "record",
+          recordInputs: originAudience === "public" && recordInputs,
+          recordOutputs: originAudience === "public" && recordOutputs,
+        });
+        for (let sequence = 0; sequence < 2; sequence++) {
+          const turnId = `turn_${sequence}`;
+          await contextStorage.run(ctx, async () => {
+            await bindInstrumentationRuntime(runtime, ctx, {
+              agentName: "child",
+              rootSessionId: "child",
+              sessionId: "child",
+            })!.preparePreamble({ sequence, sessionStarted: sequence > 0, turnId });
+          });
+          const serialized = serializeContext(ctx);
+          const traceState = JSON.stringify(serialized[AGENT_TRACE_CONTEXT_KEY]);
+          if (!includesIds) {
+            expect(traceState).not.toContain("current-user");
+            expect(traceState).not.toContain("initiator-user");
+          }
+          expect(traceState).not.toContain("auth-only-secret");
+          ctx = await deserializeContext(serialized);
+          await contextStorage.run(ctx, async () => {
+            await hooks.publish({
+              idempotencyKey: turnIdempotencyKey("child", turnId),
+              sessionId: "child",
+              turnId,
+              type: "turn.completed",
+            });
+            await hooks.publish({
+              idempotencyKey: sessionIdempotencyKey("child"),
+              sessionId: "child",
+              turnId,
+              type: "session.waiting",
+            });
+          });
+        }
+        await runtime.forceFlush();
+        const spans = runtime.exporter.getFinishedSpans();
+        expect(spans).toHaveLength(2);
+        for (const span of spans) {
+          expect(span.attributes["agent.principal.current.type"]).toBe("service");
+          expect(span.attributes["agent.principal.initiator.type"]).toBe("user");
+          expect(span.attributes["agent.principal.current.id"]).toBe(
+            includesIds ? "current-user" : undefined,
+          );
+          expect(span.attributes["agent.principal.initiator.id"]).toBe(
+            includesIds ? "initiator-user" : undefined,
+          );
+        }
+        const bytes = new TextDecoder().decode(JsonTraceSerializer.serializeRequest(spans)!);
+        expect(bytes).not.toContain("auth-only-secret");
+        if (!includesIds) {
+          expect(bytes).not.toContain("current-user");
+          expect(bytes).not.toContain("initiator-user");
+        }
+      } finally {
+        registered.mockRestore();
+        await runtime.shutdown();
+      }
     },
   );
 });

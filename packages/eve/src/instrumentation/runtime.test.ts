@@ -2,8 +2,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ContextContainer, contextStorage } from "#context/container.js";
 import {
+  AuthKey,
   ChannelInstrumentationKey,
   ConversationIdKey,
+  InitiatorAuthKey,
   OtelTraceEnabledKey,
   ParentTraceContextKey,
   ParentSessionKey,
@@ -417,6 +419,74 @@ describe("bindInstrumentationRuntime", () => {
       channelType: "slack",
     });
   });
+
+  it.each([
+    ["public", undefined, true],
+    ["private", undefined, false],
+    ["public", { action: "drop" }, false],
+    ["public", { action: "record", recordInputs: false, recordOutputs: true }, false],
+    ["public", { action: "record", recordInputs: true, recordOutputs: false }, false],
+    ["public", { action: "record", recordInputs: false, recordOutputs: false }, false],
+    ["public", { action: "record", recordInputs: true, recordOutputs: true }, true],
+  ] as const)(
+    "prepares %s turn traces with decision %j and permitted principal summaries",
+    async (audience, decision, includesId) => {
+      const ctx = createContext(audience);
+      if (decision !== undefined) {
+        ctx.set(SessionTraceSeedKey, {
+          decision,
+          spanId: "1".repeat(16),
+          traceFlags: decision.action === "drop" ? 0 : 1,
+          traceId: "2".repeat(32),
+        });
+      }
+      ctx.set(AuthKey, {
+        attributes: { email: "current@example.com" },
+        authenticator: "api-key",
+        principalId: "current-secret",
+        principalType: "service",
+      });
+      ctx.set(InitiatorAuthKey, {
+        attributes: { email: "initiator@example.com" },
+        authenticator: "oidc",
+        principalId: "initiator-secret",
+        principalType: "user",
+      });
+      const prepareTurnTrace = vi.fn().mockResolvedValue({
+        spanId: "1".repeat(16),
+        traceFlags: 1,
+        traceId: "2".repeat(32),
+      });
+      const instrumentation = bindInstrumentationRuntime(
+        {
+          ...createRuntime({ capturesContent: false, publish: vi.fn() }),
+          prepareTurnTrace,
+        },
+        ctx,
+        boundSession,
+      );
+
+      await instrumentation?.preparePreamble({
+        sequence: 0,
+        sessionStarted: true,
+        turnId: "turn-1",
+      });
+
+      const event = prepareTurnTrace.mock.calls[0]?.[0];
+      expect(event).toMatchObject({
+        currentPrincipal: { type: "service" },
+        initiatorPrincipal: { type: "user" },
+      });
+      if (includesId) {
+        expect(event?.currentPrincipal?.id).toBe("current-secret");
+        expect(event?.initiatorPrincipal?.id).toBe("initiator-secret");
+      } else {
+        expect(event?.currentPrincipal).not.toHaveProperty("id");
+        expect(event?.initiatorPrincipal).not.toHaveProperty("id");
+      }
+      expect(JSON.stringify(event)).not.toContain("@example.com");
+    },
+  );
 
   it("keeps the step-entry audience for the rest of the step", async () => {
     const ctx = createContext("private");

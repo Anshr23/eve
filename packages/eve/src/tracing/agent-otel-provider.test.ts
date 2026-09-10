@@ -36,6 +36,7 @@ import {
   type InstrumentationEvent,
   type InstrumentationHooks,
   type InstrumentationParentLineage,
+  type InstrumentationPrincipalSummary,
   type InstrumentationTraceContext,
   type InstrumentationUsage,
 } from "#instrumentation/lifecycle.js";
@@ -81,6 +82,7 @@ function createRuntime(
     recordOutputs: true,
   }),
   extraSpanProcessors: readonly SpanProcessor[] = [],
+  samplesTrace?: AgentOtelInstrumentationInput["samplesTrace"],
 ): TestRuntime {
   const exporter = new InMemorySpanExporter();
   const idGenerator = new AgentSpanIdGenerator();
@@ -96,6 +98,7 @@ function createRuntime(
     idGenerator,
     recordInputs: true,
     recordOutputs: true,
+    samplesTrace,
     stateStore,
     tracer,
   };
@@ -311,7 +314,9 @@ async function emitAttempt(input: {
 
 async function publishTurnStarted(input: {
   readonly channelAudience?: ChannelAudience;
+  readonly currentPrincipal?: InstrumentationPrincipalSummary;
   readonly hooks: InstrumentationHooks;
+  readonly initiatorPrincipal?: InstrumentationPrincipalSummary;
   readonly parentLineage?: InstrumentationParentLineage;
   readonly parentTraceContext?: InstrumentationTraceContext;
   readonly rootSessionId?: string;
@@ -334,7 +339,9 @@ async function publishTurnStarted(input: {
     type: "session.started",
   });
   await input.hooks.publish({
+    currentPrincipal: input.currentPrincipal,
     idempotencyKey: turnIdempotencyKey(input.sessionId, input.turnId),
+    initiatorPrincipal: input.initiatorPrincipal,
     parentLineage: input.parentLineage,
     parentTraceContext: input.parentTraceContext,
     rootSessionId,
@@ -511,6 +518,66 @@ describe("createAgentOtelInstrumentation", () => {
     expect(turn.parentSpanContext).toBeUndefined();
   });
 
+  it.each([
+    false,
+    { emit: true, recordInputs: false, recordOutputs: false },
+    { emit: true, recordInputs: false, recordOutputs: true },
+    { emit: true, recordInputs: true, recordOutputs: false },
+    { emit: true, recordInputs: true, recordOutputs: true },
+  ] as const)(
+    "applies trace policy %j to principals before sampling and storage",
+    async (policy) => {
+      const store = new InMemoryAgentTraceStateStore();
+      const samplesTrace = vi.fn(() => true);
+      const runtime = createRuntime(store, () => policy, [], samplesTrace);
+      const includesId = policy !== false && policy.recordInputs && policy.recordOutputs;
+      try {
+        await runtime.prepareSessionTrace({
+          agentName: "weather",
+          channelAudience: "public",
+          idempotencyKey: sessionIdempotencyKey("session-1"),
+          rootSessionId: "session-1",
+          sessionId: "session-1",
+          type: "session.started",
+        });
+        await runtime.prepareTurnTrace({
+          currentPrincipal: { id: "current-secret", type: "service" },
+          initiatorPrincipal: { id: "initiator-secret", type: "user" },
+          idempotencyKey: turnIdempotencyKey("session-1", "turn-1"),
+          rootSessionId: "session-1",
+          sequence: 0,
+          sessionId: "session-1",
+          turnId: "turn-1",
+          type: "turn.started",
+        });
+        const turn = await store.getTurn("session-1", "turn-1");
+        expect(turn?.currentPrincipal).toStrictEqual(
+          includesId ? { id: "current-secret", type: "service" } : { type: "service" },
+        );
+        expect(turn?.initiatorPrincipal).toStrictEqual(
+          includesId ? { id: "initiator-secret", type: "user" } : { type: "user" },
+        );
+        expect(samplesTrace).toHaveBeenCalledTimes(policy === false ? 0 : 1);
+        if (!includesId) expect(JSON.stringify(samplesTrace.mock.calls)).not.toContain("-secret");
+        await completeTurn(runtime.hooks, "session-1", "turn-1");
+        await runtime.provider.forceFlush();
+        const spans = runtime.exporter.getFinishedSpans();
+        expect(spans).toHaveLength(policy === false ? 0 : 1);
+        if (policy !== false) {
+          expect(spans[0]?.attributes["agent.principal.current.type"]).toBe("service");
+          expect(spans[0]?.attributes["agent.principal.current.id"]).toBe(
+            includesId ? "current-secret" : undefined,
+          );
+          expect(spans[0]?.attributes["agent.principal.initiator.id"]).toBe(
+            includesId ? "initiator-secret" : undefined,
+          );
+        }
+      } finally {
+        await runtime.provider.shutdown();
+      }
+    },
+  );
+
   it("uses the pre-allocated trace seed for the first activation root", async () => {
     const runtime = createRuntime();
     const seed: InstrumentationTraceContext = {
@@ -573,7 +640,9 @@ describe("createAgentOtelInstrumentation", () => {
     };
 
     await publishTurnStarted({
+      currentPrincipal: { id: "user-123", type: "user" },
       hooks: runtime.hooks,
+      initiatorPrincipal: { type: "none" },
       parentLineage,
       parentTraceContext: parent,
       rootSessionId: "root-session",
@@ -597,9 +666,13 @@ describe("createAgentOtelInstrumentation", () => {
       },
     ]);
     expect(invocation.attributes).toMatchObject({
+      "agent.principal.current.id": "user-123",
+      "agent.principal.current.type": "user",
+      "agent.principal.initiator.type": "none",
       "gen_ai.conversation.id": "root-session",
       "gen_ai.operation.name": "invoke_agent",
     });
+    expect(invocation.attributes).not.toHaveProperty("agent.principal.initiator.id");
     expect(invocation.attributes).not.toHaveProperty("agent.parent_call.id");
     expect(invocation.attributes).not.toHaveProperty("agent.parent_run.id");
     expect(invocation.attributes).not.toHaveProperty("agent.root_run.id");
