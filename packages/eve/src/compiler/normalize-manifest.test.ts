@@ -275,29 +275,53 @@ describe("compileAgentManifest source graph", () => {
     );
   });
 
-  it.each(["agent", "task_cancel"])(
-    "rejects overriding closed framework tool %s",
-    async (toolName) => {
-      const sourceRegistry = registry([
-        {
-          logicalPath: `tools/${toolName}.ts`,
-          loadNamespace: async () => ({
-            default: defineTool({
-              description: "Replacement tool.",
-              execute: async () => null,
-              inputSchema: {},
-            }),
+  it("allows an authored tool in the agent slot", async () => {
+    const sourceRegistry = registry([
+      {
+        logicalPath: "tools/agent.ts",
+        loadNamespace: async () => ({
+          default: defineTool({
+            availableInSubagents: false,
+            description: "Route delegated work.",
+            execute: async () => null,
+            inputSchema: {},
           }),
-        },
-      ]);
+        }),
+      },
+    ]);
 
-      await expect(
-        compileAgentManifest(manifest(), { sourceRegistries: [sourceRegistry] }),
-      ).rejects.toThrow(
-        `The framework "${toolName}" tool cannot be overridden. Re-export it from "eve/tools/${toolName}" or disable it with disableTool().`,
-      );
-    },
-  );
+    const compiled = await compileAgentManifest(manifest(), {
+      sourceRegistries: [sourceRegistry],
+    });
+
+    expect(compiled.tools.find((tool) => tool.name === "agent")).toMatchObject({
+      availableInSubagents: false,
+      behavior: { availability: [] },
+      description: "Route delegated work.",
+      execution: undefined,
+    });
+  });
+
+  it.each(["task_cancel"])("rejects overriding closed framework tool %s", async (toolName) => {
+    const sourceRegistry = registry([
+      {
+        logicalPath: `tools/${toolName}.ts`,
+        loadNamespace: async () => ({
+          default: defineTool({
+            description: "Replacement tool.",
+            execute: async () => null,
+            inputSchema: {},
+          }),
+        }),
+      },
+    ]);
+
+    await expect(
+      compileAgentManifest(manifest(), { sourceRegistries: [sourceRegistry] }),
+    ).rejects.toThrow(
+      `The framework "${toolName}" tool cannot be overridden. Re-export it from "eve/tools/${toolName}" or disable it with disableTool().`,
+    );
+  });
 
   it("compiles a workflow tool with programmatic executor metadata", async () => {
     const execute = async () => ({ ok: true });
@@ -688,6 +712,30 @@ describe("compileAgentManifest source graph", () => {
       compile: false,
       runtimeEntry: true,
     });
+  });
+
+  it("reserves the agent subagent name for root self-delegation", async () => {
+    const child = createAgentSourceManifest({
+      agentId: "agent",
+      agentRoot: "/virtual/source-test/agent/subagents/agent",
+      appRoot: "/virtual/source-test",
+    });
+    const discovered = manifest();
+    discovered.subagents.push(
+      createLocalSubagentSourceRef({
+        entryPath: child.agentRoot,
+        logicalPath: "subagents/agent",
+        manifest: child,
+        rootPath: child.agentRoot,
+        subagentId: "agent",
+      }),
+    );
+
+    await expect(
+      compileAgentManifest(discovered, { sourceRegistries: [registry([])] }),
+    ).rejects.toThrow(
+      'Subagent "subagents/agent" uses the reserved name "agent". Rename its path; eve reserves "agent" for the built-in root-copy target.',
+    );
   });
 
   it("projects a local subagent node once", async () => {

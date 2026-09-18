@@ -13,6 +13,7 @@ describe("agentRouter", () => {
   it("defines a workflow tool", () => {
     const definition = agentRouter();
 
+    expect(definition.availableInSubagents).toBe(false);
     expect(definition.description).toContain("best available subagent");
     expect(definition.execute).toBe(executeAgentRouterTool);
   });
@@ -52,7 +53,24 @@ describe("agentRouter", () => {
     expect(agent).toHaveBeenCalledWith("operator", { message: "Deploy the service" });
   });
 
-  it("invokes the only available agent without evaluation", async () => {
+  it("ignores agents without descriptions", async () => {
+    const agent = vi.fn().mockResolvedValue("researched");
+    const ctx = workflowContext({
+      agent,
+      agents: {
+        agent: { description: "" },
+        researcher: { description: "Investigate and explain." },
+      },
+    });
+
+    await expect(executeAgentRouterTool({ message: "Investigate" }, ctx)).resolves.toBe(
+      "researched",
+    );
+    expect(evaluate).not.toHaveBeenCalled();
+    expect(agent).toHaveBeenCalledWith("researcher", { message: "Investigate" });
+  });
+
+  it("invokes the only available described agent without evaluation", async () => {
     const agent = vi.fn().mockResolvedValue("researched");
     const ctx = workflowContext({
       agent,
@@ -90,11 +108,14 @@ describe("agentRouter", () => {
     });
   });
 
-  it("rejects an empty agent map before evaluation", async () => {
-    const ctx = { agents: {} } as WorkflowToolContext;
+  it("rejects an agent map without descriptions before evaluation", async () => {
+    const ctx = workflowContext({
+      agent: vi.fn(),
+      agents: { agent: { description: "  " } },
+    });
 
     await expect(executeAgentRouterTool({ message: "Route me" }, ctx)).rejects.toThrow(
-      "agentRouter requires at least one available declared subagent.",
+      "agentRouter requires at least one available agent with a description.",
     );
     expect(evaluate).not.toHaveBeenCalled();
   });

@@ -1,7 +1,7 @@
 ---
 issue: TBD
 status: in-progress
-last_updated: "2026-09-17"
+last_updated: "2026-09-18"
 ---
 
 # Subagent tool projection
@@ -37,10 +37,11 @@ The second form removes the derived `researcher` tool but not the `researcher` c
 ## Semantics
 
 - `tool` defaults to `true` for root, local, remote, workspace, and dynamically selected agents.
-- Root `tool: false` removes the built-in `agent` tool unless an authored `agent/tools/agent.ts` overrides that slot.
+- Root `tool: false` removes the built-in `agent` tool unless an authored `agent/tools/agent.ts` overrides that slot. The authored slot may contain any tool definition; tool identity does not grant root-copy invocation authority.
 - Subagent `tool: false` suppresses only its model-tool projection. Workflow `ctx.agent()` continues to resolve the child from the complete registry.
 - A same-named `disableTool()` suppresses a declared subagent's projection or the root built-in `agent` tool.
-- A same-named authored tool and subagent may coexist only when the subagent's tool projection is disabled. The authored tool owns the model name; `ctx.agent(name, input)` owns the child-agent name.
+- A same-named authored tool and subagent may coexist only when the subagent's tool projection is disabled. The authored tool owns the model name; `ctx.agent(name, input)` owns the child-agent name. The name `agent` is reserved for the built-in root-copy target and cannot identify a declared subagent.
+- `availableInSubagents: false` compiles a tool as top-level-root-only. `agentRouter()` sets it automatically, so it can own the model-facing `agent` slot without being inherited by a delegated root copy.
 - Hidden subagents retain their description, execution, authorization, task lifecycle, tracing, limits, output schema, and continuation behavior.
 - A nullish dynamic subagent selection remains unavailable to every caller. `tool: false` is visibility, not availability.
 
@@ -50,7 +51,7 @@ Each compiled agent node records its selected tools and source-composition decis
 
 ## Workflow metadata
 
-A workflow tool receives `ctx.agents`, a replay-stable snapshot of effective declared-subagent descriptions keyed by path-derived name. The snapshot includes model-visible and hidden local, remote, and active dynamic subagents, but not the built-in root-copy `agent` target, model definitions, credentials, or callbacks. Workflow invocation remains separate:
+A workflow tool receives `ctx.agents`, a replay-stable snapshot of effective callable-agent descriptions keyed by invocation name. In a top-level root session, the snapshot includes the built-in root-copy `agent` target plus model-visible and hidden local, remote, and active dynamic subagents. The root-copy entry carries an empty description when the root omits its optional description. Delegated root-copy and declared subagent contexts include only their declared targets because recursive root copying is unavailable. The snapshot contains no model definitions, credentials, or callbacks. Workflow invocation remains separate:
 
 ```ts
 const target = await chooseTarget(task, {
@@ -63,4 +64,4 @@ return ctx.agent(target, { message: task });
 
 The owner snapshots metadata when it starts the workflow run. Older in-flight workflow payloads default to an empty metadata registry. `ctx.agent()` still validates availability at invocation time, so a dynamic agent that becomes unavailable after the snapshot cannot be invoked through stale metadata.
 
-The provided `agentRouter()` workflow tool sends its input message and the complete `ctx.agents` description map to the default evaluation model (`typesafe-ai/jev`), then invokes the selected path-derived name. It forwards an optional output schema and rejects an empty declared-subagent map before evaluation. Authors use `defineWorkflowTool` directly when routing requires a subset, custom instructions, or a non-default evaluator.
+The provided `agentRouter()` workflow tool filters `ctx.agents` to entries with non-empty descriptions, sends its input message and that description map to the default evaluation model (`typesafe-ai/jev`), then invokes the selected name. It forwards an optional output schema and rejects an empty target map before evaluation. Authors use `defineWorkflowTool` directly when routing requires a subset, custom instructions, or a non-default evaluator.
