@@ -47,3 +47,20 @@ The second form removes the derived `researcher` tool but not the `researcher` c
 ## Runtime boundary
 
 Each compiled agent node records its selected tools and source-composition decisions. Runtime graph construction derives disabled tool names from that existing composition, always registers every resolved subagent by name and node id, and prepares a subagent model tool only when the child has not set `tool: false` and the parent has not disabled the same-named tool slot. Workflow `ctx.agent()` resolves from the full registry rather than the prepared model-tool list.
+
+## Workflow metadata
+
+A workflow tool receives `ctx.agents`, a replay-stable snapshot of effective declared-subagent descriptions keyed by path-derived name. The snapshot includes model-visible and hidden local, remote, and active dynamic subagents, but not the built-in root-copy `agent` target, model definitions, credentials, or callbacks. Workflow invocation remains separate:
+
+```ts
+const target = await chooseTarget(task, {
+  researcher: ctx.agents.researcher.description,
+  operator: ctx.agents.operator.description,
+});
+
+return ctx.agent(target, { message: task });
+```
+
+The owner snapshots metadata when it starts the workflow run. Older in-flight workflow payloads default to an empty metadata registry. `ctx.agent()` still validates availability at invocation time, so a dynamic agent that becomes unavailable after the snapshot cannot be invoked through stale metadata.
+
+The provided `agentRouter()` workflow tool sends its input message and the complete `ctx.agents` description map to the default evaluation model (`typesafe-ai/jev`), then invokes the selected path-derived name. It forwards an optional output schema and rejects an empty declared-subagent map before evaluation. Authors use `defineWorkflowTool` directly when routing requires a subset, custom instructions, or a non-default evaluator.
