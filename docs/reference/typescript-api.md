@@ -12,7 +12,7 @@ Most files look the same: import a helper, default-export the result.
 ```ts title="agent/agent.ts"
 import { defineAgent } from "eve";
 
-export default defineAgent({ model: "anthropic/claude-opus-4.8" });
+export default defineAgent({ model: "anthropic/claude-opus-5.5" });
 ```
 
 ```ts title="agent/tools/get_weather.ts"
@@ -156,13 +156,13 @@ Exported types ship from the same entrypoint as the helper they describe (for ex
 
 ## Direct provider models
 
-`openai(model?)` from `eve/models/openai` and `anthropic(model?)` from `eve/models/anthropic` return eve-owned model instances using the vendored providers. They accept only an optional model ID. Defaults are `gpt-5.6-luna-fast` and `claude-sonnet-5`, respectively.
+`openai(model?)` from `eve/models/openai` and `anthropic(model?)` from `eve/models/anthropic` return eve-owned model instances using the vendored providers. They accept only an optional model ID. Defaults are `gpt-6-luna-fast` and `claude-sonnet-5`, respectively.
 
 Use `/login` for local credentials, or set `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`. Local secret-store discovery is disabled in deployments; provision server credentials explicitly. See [Set the model](../agent-config#set-the-model) for an example.
 
 ## ChatGPT subscription models
 
-`chatgpt()` from `eve/models/openai` serves an OpenAI model through your local ChatGPT login and bills the ChatGPT subscription. With no argument, it selects `gpt-5.6-luna-fast`:
+`chatgpt()` from `eve/models/openai` serves an OpenAI model through your local ChatGPT login and bills the ChatGPT subscription. With no argument, it selects `gpt-6-luna-fast`:
 
 ```ts title="agent/agent.ts"
 import { defineAgent } from "eve";
