@@ -1650,7 +1650,7 @@ describe("TerminalRenderer (inline scrollback)", () => {
     expect(snapshot).toContain("┌── Session restarted, clear context.");
   });
 
-  it("closes the dying turn's coda and dismisses the todo panel at the boundary", async () => {
+  it("closes the dying turn's coda at the boundary", async () => {
     const { screen, input, renderer } = makeRenderer();
     const prompt = renderer.readPrompt();
     input.type("hey agent");
@@ -1660,17 +1660,6 @@ describe("TerminalRenderer (inline scrollback)", () => {
     await renderer.renderStream(
       streamOf([
         { type: "step-start" },
-        {
-          type: "tool-call",
-          toolCallId: "t1",
-          toolName: "todo",
-          input: {
-            todos: [
-              { content: "first task", status: "in_progress" },
-              { content: "second task", status: "pending" },
-            ],
-          },
-        },
         { type: "assistant-delta", id: "m1", delta: "working" },
         { type: "assistant-complete", id: "m1" },
         { type: "step-finish", usage: { inputTokens: 25_000, outputTokens: 40 } },
@@ -1678,15 +1667,12 @@ describe("TerminalRenderer (inline scrollback)", () => {
       ]),
       { continueSession: true },
     );
-    expect(screen.snapshot()).toContain("first task");
 
     renderer.renderSessionBoundary();
     const snapshot = screen.snapshot();
-    // The dead turn's stats close before the boundary, not after it…
+    // The dead turn's stats close before the boundary, not after it.
     expect(snapshot.indexOf("└ Done in")).toBeGreaterThan(-1);
     expect(snapshot.indexOf("└ Done in")).toBeLessThan(snapshot.indexOf("┌── Session restarted"));
-    // …and the discarded session's plan dismisses instead of lingering.
-    expect(snapshot).not.toContain("first task");
 
     // Control returning to the prompt must not add a second coda.
     const second = renderer.readPrompt();
@@ -2928,13 +2914,13 @@ describe("TerminalRenderer (inline scrollback)", () => {
     expect(screen.snapshot()).toContain("Esc to dismiss");
 
     await escape();
-    // No answer travels; the runner returns to the prompt and the server
-    // records the parked request as ignored on the next message.
+    // No answer travels; the runner returns to the prompt and the question
+    // stays open for the next message.
     await expect(answer).resolves.toBeUndefined();
 
     const snapshot = screen.snapshot();
     expect(snapshot).toContain("? Choose access");
-    expect(snapshot).toContain("⎿  Dismissed.");
+    expect(snapshot).toContain("⎿  Skipped. The question stays open.");
     // The option list does not survive the dismissal.
     expect(snapshot).not.toContain("Managed access");
     expect(snapshot).not.toContain("Enter to select");
@@ -2965,7 +2951,7 @@ describe("TerminalRenderer (inline scrollback)", () => {
 
     await escape();
     await expect(answer).resolves.toBeUndefined();
-    expect(screen.snapshot()).toContain("⎿  Dismissed.");
+    expect(screen.snapshot()).toContain("⎿  Skipped. The question stays open.");
     renderer.shutdown();
   });
 
@@ -3082,7 +3068,7 @@ describe("TerminalRenderer (inline scrollback)", () => {
 
     await escape();
     await expect(answer).resolves.toBeUndefined();
-    expect(screen.snapshot()).toContain("⎿  Dismissed.");
+    expect(screen.snapshot()).toContain("⎿  Skipped. The question stays open.");
     renderer.shutdown();
   });
 
