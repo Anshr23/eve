@@ -1,4 +1,8 @@
-import type { MutableNetworkSandboxSession } from "#shared/sandbox-session.js";
+import type { SandboxNetworkPolicy } from "#shared/sandbox-network-policy.js";
+import type { SandboxSession } from "#shared/sandbox-session.js";
+type NetworkPolicySandboxSession = SandboxSession & {
+  setNetworkPolicy(policy: SandboxNetworkPolicy): Promise<void>;
+};
 import { randomUUID } from "node:crypto";
 
 import {
@@ -90,7 +94,7 @@ export function createDockerSandboxProvider(
   DockerSandboxRuntimeOptions,
   DockerSandboxPreparedArtifact,
   DockerSandboxSessionState,
-  MutableNetworkSandboxSession
+  NetworkPolicySandboxSession
 > {
   const cli = dockerCli ?? createDockerCli();
   const authoredOptions = createOptions ?? {};
