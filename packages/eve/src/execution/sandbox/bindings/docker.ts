@@ -2,7 +2,6 @@ import type { MutableNetworkSandboxSession } from "#shared/sandbox-session.js";
 import { randomUUID } from "node:crypto";
 
 import {
-  DOCKER_SANDBOX_LABEL,
   runDockerBaseSetup,
   startDockerContainer,
   stopDockerContainerIfRunning,
@@ -19,6 +18,7 @@ import {
 } from "#execution/sandbox/bindings/docker-options.js";
 import { createDockerInternalSession } from "#execution/sandbox/bindings/docker-session.js";
 import {
+  commitDockerTemplateImage,
   dockerImageExists,
   dockerTemplateImageReference,
   ensureDockerBaseImage,
@@ -276,20 +276,15 @@ export function createDockerSandboxProvider(
           `stop template build container "${buildContainerName}"`,
         );
         context.log?.(`committing template image "${imageReference}"`);
-        expectDockerSuccess(
-          await cli.run([
-            "commit",
-            "--change",
-            `LABEL ${DOCKER_SANDBOX_LABEL}=1`,
-            "--change",
-            `LABEL ${DOCKER_SANDBOX_LABEL}.role=template`,
-            "--change",
-            `LABEL ${DOCKER_SANDBOX_LABEL}.template-key=${templateKey}`,
-            buildContainerIdentity,
-            imageReference,
-          ]),
-          `commit sandbox template image "${imageReference}"`,
-        );
+        const commit = await commitDockerTemplateImage({
+          cli,
+          containerIdentity: buildContainerIdentity,
+          imageReference,
+          templateKey,
+        });
+        if (commit === "reused") {
+          context.log?.("reusing concurrently published template image");
+        }
         await touchDockerTemplateMarker(markerPath, imageReference);
       } finally {
         await cli.run(["rm", "-f", buildContainerName]).catch(() => {});
