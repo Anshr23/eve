@@ -6678,6 +6678,30 @@ describe("createToolLoopHarness", () => {
     });
   });
 
+  it("dispatches model selection with the active turn ID when a continuation has no turn input", async () => {
+    setupMockAgent({
+      finishReason: "stop",
+      response: { messages: [{ content: "Done", role: "assistant" }] },
+      text: "Done",
+      toolCalls: [],
+      toolResults: [],
+    });
+
+    const dispatchDynamicModelEvent = vi.fn();
+    const { emit } = createEventCollector();
+    const harness = createToolLoopHarness(
+      createTestConfig("conversation", emit, { dispatchDynamicModelEvent, tools: new Map() }),
+    );
+
+    await contextStorage.run(new ContextContainer(), () => harness(createTestSession()));
+
+    expect(dispatchDynamicModelEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: expect.objectContaining({ data: expect.objectContaining({ turnId: "turn_0" }) }),
+      }),
+    );
+  });
+
   it("persists the SDK's accumulated approval-resume messages into session history", async () => {
     /*
      * The real AI SDK contract is covered in
